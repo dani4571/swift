@@ -30,7 +30,8 @@ from swift.common.utils import audit_location_generator, get_logger, \
     hash_path, config_true_value, validate_sync_to, whataremyips
 from swift.common.daemon import Daemon
 from swift.common.http import HTTP_UNAUTHORIZED, HTTP_NOT_FOUND
-
+import requests
+import json
 
 class _Iter2FileLikeObject(object):
     """
@@ -264,13 +265,19 @@ class ContainerSync(Daemon):
             if not broker.is_deleted():
                 sync_to = None
                 sync_key = None
+                rack_sync = False
+                rack_container = None
                 sync_point1 = info['x_container_sync_point1']
                 sync_point2 = info['x_container_sync_point2']
+
                 for key, (value, timestamp) in broker.metadata.iteritems():
                     if key.lower() == 'x-container-sync-to':
                         sync_to = value
                     elif key.lower() == 'x-container-sync-key':
                         sync_key = value
+                    elif key.lower() == 'x-container-meta-rack-sync-info':
+                        rack_sync = True
+                        rack_info = value
                 if not sync_to or not sync_key:
                     self.container_skips += 1
                     self.logger.increment('skips')
@@ -302,10 +309,16 @@ class ContainerSync(Daemon):
                     # This section will attempt to sync previously skipped
                     # rows in case the previous attempts by any of the nodes
                     # didn't succeed.
-                    if not self.container_sync_row(row, sync_to, sync_key,
+                    if rack_sync:
+                        if not self.container_rack_sync_row(row, sync_to, sync_key,
+                                                            rack_info, broker, info):
+                            if not next_sync_point:
+                                next_sync_point = sync_point2
+                    elif not self.container_sync_row(row, sync_to, sync_key,
                                                    broker, info):
                         if not next_sync_point:
                             next_sync_point = sync_point2
+                    
                     sync_point2 = row['ROWID']
                     broker.set_x_container_sync_points(None, sync_point2)
                 if next_sync_point:
@@ -324,8 +337,12 @@ class ContainerSync(Daemon):
                     # succeed or in case it failed to do so the first time.
                     if unpack_from('>I', key)[0] % \
                             len(nodes) == ordinal:
-                        self.container_sync_row(row, sync_to, sync_key,
-                                                broker, info)
+                        if rack_sync:
+                            self.container_rack_sync_row(row, sync_to, sync_key,
+                                                        rack_info, broker, info)
+                        else:
+                            self.container_sync_row(row, sync_to, sync_key,
+                                                    broker, info)
                     sync_point1 = row['ROWID']
                     broker.set_x_container_sync_points(sync_point1, None)
                 self.container_syncs += 1
@@ -443,3 +460,161 @@ class ContainerSync(Daemon):
             self.logger.increment('failures')
             return False
         return True
+
+    def container_rack_sync_row(self, row, sync_to, sync_key, rack_info, broker, info):
+        """
+        Sends the update to the row indicated. sync_to endpoint is for auth and 
+        cloud files endpoint is found after auth.
+
+
+        :param row: The updated row in the local database triggering the sync
+                    update.
+        :param sync_to: The URL to RAX authentication.
+        :param sync_key: The X-Container-Sync-Key is public cloud API key
+        :param rack_info: Rackspace info in the form of username/remote_container/REGION (DFW/IAD etc.)
+        :param broker: The local container database broker.
+        :param info: The get_info result from the local container database
+                     broker.
+        :returns: True on success
+        """
+        username, container, region = rack_info.split("/")
+        rack_account_info = self.rackspace_auth(sync_to, username, sync_key, region)
+        sync_url = rack_account_info['endpoint'] + "/" + container
+        auth_token = rack_account_info['authtoken']
+
+        try:
+            start_time = time()
+            if row['deleted']:
+                try:
+                    delete_object(sync_url, token=auth_token, name=row['name'])
+                except ClientException, err:
+                    if err.http_status != HTTP_NOT_FOUND:
+                        raise
+                self.container_deletes += 1
+                self.logger.increment('deletes')
+                self.logger.timing_since('deletes.timing', start_time)
+            else:
+                part, nodes = self.object_ring.get_nodes(
+                    info['account'], info['container'],
+                    row['name'])
+                shuffle(nodes)
+                exc = None
+                looking_for_timestamp = float(row['created_at'])
+                timestamp = -1
+                headers = body = None
+                for node in nodes:
+                    try:
+                        these_headers, this_body = direct_get_object(
+                            node, part, info['account'], info['container'],
+                            row['name'], resp_chunk_size=65536)
+                        this_timestamp = float(these_headers['x-timestamp'])
+                        if this_timestamp > timestamp:
+                            timestamp = this_timestamp
+                            headers = these_headers
+                            body = this_body
+                    except ClientException, err:
+                        # If any errors are not 404, make sure we report the
+                        # non-404 one. We don't want to mistakenly assume the
+                        # object no longer exists just because one says so and
+                        # the others errored for some other reason.
+                        if not exc or exc.http_status == HTTP_NOT_FOUND:
+                            exc = err
+                    except (Exception, Timeout), err:
+                        exc = err
+                if timestamp < looking_for_timestamp:
+                    if exc:
+                        raise exc
+                    raise Exception(
+                        _('Unknown exception trying to GET: %(node)r '
+                          '%(account)r %(container)r %(object)r'),
+                        {'node': node, 'part': part,
+                         'account': info['account'],
+                         'container': info['container'],
+                         'object': row['name']})
+                for key in ('date', 'last-modified'):
+                    if key in headers:
+                        del headers[key]
+                if 'etag' in headers:
+                    headers['etag'] = headers['etag'].strip('"')
+                headers['x-timestamp'] = row['created_at']
+                headers['x-auth-token'] = auth_token
+                put_object(sync_url, name=row['name'], headers=headers,
+                           contents=_Iter2FileLikeObject(body),
+                           proxy=self.proxy)
+                self.container_puts += 1
+                self.logger.increment('puts')
+                self.logger.timing_since('puts.timing', start_time)
+        except ClientException, err:
+            if err.http_status == HTTP_UNAUTHORIZED:
+                self.logger.info(
+                    _('Unauth %(sync_from)r => %(sync_url)r'),
+                    {'sync_from': '%s/%s' %
+                        (quote(info['account']), quote(info['container'])),
+                     'sync_url': sync_url})
+            elif err.http_status == HTTP_NOT_FOUND:
+                self.logger.info(
+                    _('Not found %(sync_from)r => %(sync_url)r \
+                      - object %(obj_name)r'),
+                    {'sync_from': '%s/%s' %
+                        (quote(info['account']), quote(info['container'])),
+                     'sync_url': sync_url, 'obj_name': row['name']})
+            else:
+                self.logger.exception(
+                    _('ERROR Syncing %(db_file)s %(row)s'),
+                    {'db_file': broker.db_file, 'row': row})
+            self.container_failures += 1
+            self.logger.increment('failures')
+            return False
+        except (Exception, Timeout), err:
+            self.logger.exception(
+                _('ERROR Syncing %(db_file)s %(row)s'),
+                {'db_file': broker.db_file, 'row': row})
+            self.container_failures += 1
+            self.logger.increment('failures')
+            return False
+        return True
+
+
+    def rackspace_auth(self, sync_to, username, apikey, region):
+        payload = {"auth":
+                        {"RAX-KSKEY:apiKeyCredentials":
+                                {"username": username, "apiKey": apikey}
+                        }
+                }
+        # headers to send to the cloud servers auth
+        headers = {'content-type': 'application/json'}
+
+        # send auth request
+        self.logger.debug('RAX url: %s data: %s headers: %s' % (sync_to, payload, headers))
+        r = requests.post(sync_to, data=json.dumps(payload), headers=headers)
+
+        # Load the returned content into a json object
+        content = json.loads(r.content)
+
+        # Save returned information
+        try: 
+            account = content['access']['token']['tenant']['id']
+            authtoken = content['access']['token']['id']
+            catalogs = content['access']['serviceCatalog']
+        except Exception, err:
+            self.logger.exception(
+                    'Error retrieving rackspace information.'
+                    'Enter debug for request info.')
+            raise err
+
+        storage_endpoint = None
+        for entry in catalogs:
+            if entry['type'] == 'object-store':
+                for endpoint in entry['endpoints']:
+                    if endpoint['region'] == region:
+                        storage_endpoint =  endpoint['publicURL']
+
+        # Create a dict to return
+        if authtoken is None or storage_endpoint is None:
+            self.logger.exception('Error retrieving rackspace endpoint or authtoken.'
+                    'Enter debug for request info. endpoint: %s token: %s' % (authtoken, storage_endpoint))
+            raise Exception('Unable to retrieve storage endpoint or authtoken.'
+                            'token: %s endpoint %s.' % (authtoken, storage_endpoint))
+        info = {"authtoken" : authtoken, "endpoint" : storage_endpoint}
+        return info
+
